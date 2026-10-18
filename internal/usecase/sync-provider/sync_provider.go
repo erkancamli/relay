@@ -21,6 +21,8 @@ type repo interface {
 	GetSignatureRequestsWithoutAggregationProof(ctx context.Context, epoch symbiotic.Epoch, limit int, lastHash common.Hash) ([]symbiotic.SignatureRequestWithID, error)
 	GetAggregationProof(ctx context.Context, requestID common.Hash) (symbiotic.AggregationProof, error)
 	RemoveAggregationProofPending(ctx context.Context, epoch symbiotic.Epoch, requestID common.Hash) error
+	GetSignatureRequestIDsByEpoch(ctx context.Context, epoch symbiotic.Epoch, pageSize int, from []byte) ([]common.Hash, []byte, error)
+	GetActiveValidatorCountByEpoch(ctx context.Context, epoch symbiotic.Epoch) (uint32, error)
 }
 
 type entityProcessor interface {

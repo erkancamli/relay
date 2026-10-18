@@ -38,6 +38,7 @@ func (s *Syncer) BuildWantSignaturesRequest(ctx context.Context) (entity.WantSig
 // 3. For each epoch, fetches pending signature requests in batches
 // 4. For each request, identifies validators that haven't provided signatures yet
 // 5. Builds a map where keys are request ids and values are bitmaps of missing validators
+// 6. Adds requests of the same epochs that have no signatures yet, asking for all active validators
 //
 // The scanning is limited by MaxSignatureRequestsPerSync to prevent excessive memory usage
 // and network overhead during synchronization.
@@ -138,7 +139,97 @@ func (s *Syncer) buildWantSignaturesMap(ctx context.Context) (map[common.Hash]en
 		}
 	}
 
+	if err := s.addRequestsWithoutSignatures(ctx, wantSignatures, startEpoch, latestEpoch, s.cfg.MaxSignatureRequestsPerSync-totalRequests); err != nil {
+		tracing.RecordError(span, err)
+		return nil, err
+	}
+
 	tracing.SetAttributes(span, attribute.Int("response.want_signatures_count", len(wantSignatures)))
 
 	return wantSignatures, nil
+}
+
+// addRequestsWithoutSignatures adds the signature requests of the scanned epochs that have
+// no signature map yet, at most limit of them. The pending index used above only gets an
+// entry when a signature is saved, so a node that has a request but no signatures for it
+// would otherwise never ask its peers for any.
+//
+// Requests with a signature map are left to the pending index scan.
+func (s *Syncer) addRequestsWithoutSignatures(ctx context.Context, wantSignatures map[common.Hash]entity.Bitmap, startEpoch, latestEpoch symbiotic.Epoch, limit int) error {
+	added := 0
+
+	for epoch := latestEpoch; epoch >= startEpoch && added < limit; epoch-- {
+		var from []byte
+
+		for added < limit {
+			// Every id adds at most one request, so a page never goes over the limit.
+			requestIDs, next, err := s.cfg.Repo.GetSignatureRequestIDsByEpoch(ctx, epoch, limit-added, from)
+			if err != nil {
+				return errors.Errorf("failed to get signature request ids for epoch %d: %w", epoch, err)
+			}
+
+			for _, requestID := range requestIDs {
+				missingValidators, err := s.missingValidatorsWithoutSignatureMap(ctx, requestID)
+				if err != nil {
+					return err
+				}
+				if missingValidators.Bitmap == nil || missingValidators.IsEmpty() {
+					continue
+				}
+				wantSignatures[requestID] = missingValidators
+				added++
+			}
+
+			if next == nil {
+				break
+			}
+			from = next
+		}
+
+		if epoch == 0 {
+			break
+		}
+	}
+
+	return nil
+}
+
+// missingValidatorsWithoutSignatureMap returns all active validator indices of the request's
+// epoch if the request has no signature map yet, and an empty bitmap otherwise. The indices
+// come from the validator set of the request's required epoch, which is the index space the
+// signature map of that request uses once its first signature is saved.
+func (s *Syncer) missingValidatorsWithoutSignatureMap(ctx context.Context, requestID common.Hash) (entity.Bitmap, error) {
+	_, err := s.cfg.Repo.GetSignatureMap(ctx, requestID)
+	if err == nil {
+		return entity.Bitmap{}, nil
+	}
+	if !errors.Is(err, entity.ErrEntityNotFound) {
+		return entity.Bitmap{}, errors.Errorf("failed to get signature map for request %s: %w", requestID.Hex(), err)
+	}
+
+	req, err := s.cfg.Repo.GetSignatureRequest(ctx, requestID)
+	if err != nil {
+		if errors.Is(err, entity.ErrEntityNotFound) {
+			return entity.Bitmap{}, nil
+		}
+		return entity.Bitmap{}, errors.Errorf("failed to get signature request %s: %w", requestID.Hex(), err)
+	}
+
+	// Signatures are not needed anymore once the aggregation proof exists
+	if req.KeyTag.Type().AggregationKey() {
+		if _, err := s.cfg.Repo.GetAggregationProof(ctx, requestID); err == nil {
+			return entity.Bitmap{}, nil
+		}
+	}
+
+	activeValidators, err := s.cfg.Repo.GetActiveValidatorCountByEpoch(ctx, req.RequiredEpoch)
+	if err != nil {
+		if errors.Is(err, entity.ErrEntityNotFound) {
+			return entity.Bitmap{}, nil
+		}
+		return entity.Bitmap{}, errors.Errorf("failed to get active validator count for epoch %d: %w", req.RequiredEpoch, err)
+	}
+
+	signatureMap := entity.NewSignatureMap(requestID, req.RequiredEpoch, activeValidators)
+	return signatureMap.GetMissingValidators(), nil
 }
